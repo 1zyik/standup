@@ -24,7 +24,7 @@ export async function generateWithAI(
     const client = new Anthropic({ apiKey });
     const response = await client.messages.create({
       model,
-      max_tokens: 2000,
+      max_tokens: 4000,
       system: systemPrompt,
       messages: [{ role: "user", content: userMessage }],
     });
@@ -44,7 +44,7 @@ export async function generateWithAI(
     },
     body: JSON.stringify({
       model,
-      max_tokens: 2000,
+      max_tokens: 4000,
       messages: [
         { role: "system", content: systemPrompt },
         { role: "user", content: userMessage },

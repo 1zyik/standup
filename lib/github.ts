@@ -1,3 +1,9 @@
+export type ThreadComment = {
+  author: string;
+  body: string;
+  created_at: string;
+};
+
 export type GitHubPR = {
   id: number;
   number: number;
@@ -11,6 +17,9 @@ export type GitHubPR = {
   body: string | null;
   draft: boolean;
   labels: string[];
+  comments?: ThreadComment[];
+  reviewComments?: ThreadComment[];
+  linkedRefs?: string[]; // e.g. ["owner/repo#42", "#17"] extracted from body
 };
 
 export type GitHubIssue = {
@@ -25,6 +34,8 @@ export type GitHubIssue = {
   body: string | null;
   labels: string[];
   assignee: boolean;
+  comments?: ThreadComment[];
+  linkedRefs?: string[];
 };
 
 export type GitHubReview = {
@@ -193,6 +204,85 @@ export async function fetchGitHubData(
         (a) => (a as Record<string, unknown>).login === user.login
       ),
     }));
+
+  // ── Enrichment: fetch comments + linked refs for recently active PRs/issues ──
+  // Bounded to keep latency reasonable: top N by updated_at, ≤8 comments each.
+  const MAX_ENRICH_PRS = 8;
+  const MAX_ENRICH_ISSUES = 8;
+  const MAX_COMMENTS = 8;
+
+  function extractLinkedRefs(text: string | null, selfRepo: string): string[] {
+    if (!text) return [];
+    const refs = new Set<string>();
+    // Cross-repo refs: owner/repo#123
+    for (const m of text.matchAll(/([\w.-]+\/[\w.-]+)#(\d+)/g)) {
+      refs.add(`${m[1]}#${m[2]}`);
+    }
+    // Same-repo refs: #123 (but not preceded by a slash, handled above)
+    for (const m of text.matchAll(/(?<![\w/])#(\d+)/g)) {
+      refs.add(`${selfRepo}#${m[1]}`);
+    }
+    // Full GitHub URLs to issues/PRs
+    for (const m of text.matchAll(/https:\/\/github\.com\/([\w.-]+\/[\w.-]+)\/(?:issues|pull)\/(\d+)/g)) {
+      refs.add(`${m[1]}#${m[2]}`);
+    }
+    return [...refs].slice(0, 8);
+  }
+
+  function trimComment(body: string): string {
+    // Collapse whitespace and truncate to keep LLM context manageable.
+    return body.replace(/\s+/g, " ").trim().slice(0, 400);
+  }
+
+  async function fetchComments(repo: string, number: number): Promise<ThreadComment[]> {
+    try {
+      const data = await ghFetch(`/repos/${repo}/issues/${number}/comments?per_page=${MAX_COMMENTS}&sort=created&direction=desc`, token);
+      if (!Array.isArray(data)) return [];
+      return data
+        .map((c: Record<string, unknown>) => ({
+          author: ((c.user as Record<string, unknown>)?.login as string) || "unknown",
+          body: trimComment((c.body as string) || ""),
+          created_at: c.created_at as string,
+        }))
+        .filter((c) => c.body.length > 0)
+        .slice(0, MAX_COMMENTS);
+    } catch { return []; }
+  }
+
+  async function fetchReviewComments(repo: string, number: number): Promise<ThreadComment[]> {
+    try {
+      const data = await ghFetch(`/repos/${repo}/pulls/${number}/comments?per_page=${MAX_COMMENTS}&sort=created&direction=desc`, token);
+      if (!Array.isArray(data)) return [];
+      return data
+        .map((c: Record<string, unknown>) => ({
+          author: ((c.user as Record<string, unknown>)?.login as string) || "unknown",
+          body: trimComment((c.body as string) || ""),
+          created_at: c.created_at as string,
+        }))
+        .filter((c) => c.body.length > 0)
+        .slice(0, MAX_COMMENTS);
+    } catch { return []; }
+  }
+
+  // Sort PRs and issues by most recently updated, enrich the top N in parallel.
+  const prsByRecency = [...prs].sort((a, b) => b.updated_at.localeCompare(a.updated_at));
+  const issuesByRecency = [...issues].sort((a, b) => b.updated_at.localeCompare(a.updated_at));
+
+  await Promise.all([
+    ...prsByRecency.slice(0, MAX_ENRICH_PRS).map(async (pr) => {
+      const [cs, rcs] = await Promise.all([
+        fetchComments(pr.repo, pr.number),
+        fetchReviewComments(pr.repo, pr.number),
+      ]);
+      pr.comments = cs;
+      pr.reviewComments = rcs;
+      pr.linkedRefs = extractLinkedRefs(pr.body, pr.repo);
+    }),
+    ...issuesByRecency.slice(0, MAX_ENRICH_ISSUES).map(async (issue) => {
+      issue.comments = await fetchComments(issue.repo, issue.number);
+      issue.linkedRefs = extractLinkedRefs(issue.body, issue.repo);
+    }),
+  ]);
 
   // Process reviews
   const reviews: GitHubReview[] = reviewSearch.items
