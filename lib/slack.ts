@@ -1,3 +1,10 @@
+export type SlackThreadReply = {
+  user: string;
+  real_name?: string;
+  text: string;
+  ts: string;
+};
+
 export type SlackMessage = {
   channel_id: string;
   channel_name: string;
@@ -6,6 +13,7 @@ export type SlackMessage = {
   permalink: string | null;
   thread_ts: string | null;
   reply_count?: number;
+  thread?: SlackThreadReply[];
 };
 
 export type SlackChannel = {
@@ -196,6 +204,53 @@ export async function fetchSlackData(
 
   // Sort by ts desc
   messages.sort((a, b) => parseFloat(b.ts) - parseFloat(a.ts));
+
+  // ── Enrichment: fetch thread replies for messages the user participated in ──
+  // Bounded: top 15 threaded messages, ≤10 replies each, ≤200 chars per reply.
+  const userNameCache = new Map<string, string>();
+  async function resolveUserName(id: string): Promise<string> {
+    if (!id) return "unknown";
+    if (userNameCache.has(id)) return userNameCache.get(id)!;
+    try {
+      const res = await slackFetch("users.info", auth, { user: id });
+      const name = (res.user?.profile?.real_name as string) || (res.user?.name as string) || id;
+      userNameCache.set(id, name);
+      return name;
+    } catch {
+      userNameCache.set(id, id);
+      return id;
+    }
+  }
+
+  const threadedCandidates = messages
+    .filter((m) => (m.reply_count ?? 0) > 0 || m.thread_ts)
+    .slice(0, 15);
+
+  await Promise.all(
+    threadedCandidates.map(async (m) => {
+      const parentTs = m.thread_ts || m.ts;
+      try {
+        const res = await slackFetch("conversations.replies", auth, {
+          channel: m.channel_id,
+          ts: parentTs,
+          limit: "12",
+        });
+        const replies: SlackThreadReply[] = [];
+        for (const r of (res.messages as Array<Record<string, unknown>> | undefined) ?? []) {
+          if ((r.ts as string) === parentTs) continue; // skip parent
+          const text = ((r.text as string) || "").slice(0, 300);
+          if (!text) continue;
+          const uid = (r.user as string) || "";
+          const real_name = uid ? await resolveUserName(uid) : undefined;
+          replies.push({ user: uid, real_name, text, ts: r.ts as string });
+          if (replies.length >= 10) break;
+        }
+        if (replies.length > 0) m.thread = replies;
+      } catch {
+        // best-effort — skip threads we can't read
+      }
+    })
+  );
 
   const channels: SlackChannel[] = Array.from(channelSet.entries()).map(([id, name]) => ({
     id,

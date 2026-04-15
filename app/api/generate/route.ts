@@ -28,6 +28,17 @@ function fmt(iso: string) {
 
 type TimestampedItem = { date: string; source: string; text: string; url?: string };
 
+function formatThread(items: { author?: string; user?: string; real_name?: string; body?: string; text?: string }[]): string {
+  return items
+    .map((c) => {
+      const who = c.author || c.real_name || c.user || "unknown";
+      const what = (c.body || c.text || "").trim();
+      return what ? `    ↳ @${who}: ${what}` : null;
+    })
+    .filter(Boolean)
+    .join("\n");
+}
+
 function ghItems(gh: GitHubData): TimestampedItem[] {
   const items: TimestampedItem[] = [];
 
@@ -35,10 +46,15 @@ function ghItems(gh: GitHubData): TimestampedItem[] {
     const date = isoDay(pr.merged_at || pr.updated_at);
     const status = pr.state === "merged" ? "Merged PR" : pr.state === "open" ? "Opened PR" : "Closed PR";
     const draft = pr.draft ? " [Draft]" : "";
+    const labels = pr.labels.length ? ` {labels: ${pr.labels.join(", ")}}` : "";
+    const linked = pr.linkedRefs?.length ? `\n    linked: ${pr.linkedRefs.join(", ")}` : "";
+    const body = pr.body ? `\n    description: ${pr.body.replace(/\s+/g, " ").slice(0, 400)}` : "";
+    const conv = [...(pr.comments ?? []), ...(pr.reviewComments ?? [])];
+    const thread = conv.length ? `\n${formatThread(conv)}` : "";
     items.push({
       date,
       source: "GitHub",
-      text: `${status}${draft}: [${pr.repo}#${pr.number}](${pr.url}) — ${pr.title}`,
+      text: `${status}${draft}: [${pr.repo}#${pr.number}](${pr.url}) — ${pr.title}${labels}${body}${linked}${thread}`,
       url: pr.url,
     });
   }
@@ -56,10 +72,14 @@ function ghItems(gh: GitHubData): TimestampedItem[] {
   for (const issue of gh.issues.slice(0, 20)) {
     const date = isoDay(issue.updated_at);
     const status = issue.state === "closed" ? "Closed issue" : "Worked on issue";
+    const labels = issue.labels.length ? ` {labels: ${issue.labels.join(", ")}}` : "";
+    const linked = issue.linkedRefs?.length ? `\n    linked: ${issue.linkedRefs.join(", ")}` : "";
+    const body = issue.body ? `\n    description: ${issue.body.replace(/\s+/g, " ").slice(0, 300)}` : "";
+    const thread = issue.comments?.length ? `\n${formatThread(issue.comments)}` : "";
     items.push({
       date,
       source: "GitHub",
-      text: `${status}: [${issue.repo}#${issue.number}](${issue.url}) — ${issue.title}`,
+      text: `${status}: [${issue.repo}#${issue.number}](${issue.url}) — ${issue.title}${labels}${body}${linked}${thread}`,
       url: issue.url,
     });
   }
@@ -78,12 +98,15 @@ function ghItems(gh: GitHubData): TimestampedItem[] {
 }
 
 function slItems(sl: SlackData): TimestampedItem[] {
-  return sl.messages.slice(0, 60).map((m) => ({
-    date: slackDay(m.ts),
-    source: "Slack",
-    text: `#${m.channel_name || m.channel_id}: ${m.text.slice(0, 300)}`,
-    url: m.permalink || undefined,
-  }));
+  return sl.messages.slice(0, 60).map((m) => {
+    const thread = m.thread?.length ? `\n${formatThread(m.thread)}` : "";
+    return {
+      date: slackDay(m.ts),
+      source: "Slack",
+      text: `#${m.channel_name || m.channel_id}: ${m.text.slice(0, 400)}${thread}`,
+      url: m.permalink || undefined,
+    };
+  });
 }
 
 function glItems(gl: GitLabData): TimestampedItem[] {
@@ -163,39 +186,47 @@ function buildContext(allItems: TimestampedItem[], dateFrom: string, dateTo: str
 // ─── System prompt ────────────────────────────────────────────────────────────
 
 function buildSystemPrompt(dateFrom: string, dateTo: string): string {
-  return `You are a professional engineering standup writer. Synthesize the provided activity into a concise, professional scrum standup update.
+  return `You are a senior engineer writing your own standup. Your audience is other engineers and an engineering manager — they want substance, not a list of links. Synthesize the activity below into a technically credible, professionally-toned standup update.
 
-REQUIRED OUTPUT FORMAT — follow this exactly:
+BEFORE YOU WRITE — reason carefully over the raw activity:
+
+1. Read each PR's description, review comments, and issue comments in full. The titles alone are not the story — the *discussion* is. Use comments to understand: what was the actual change, what concerns were raised, what was pushed back on, what was agreed, and what remains unresolved.
+2. Follow \`linked:\` references between PRs and issues. If a PR closes or references an issue, tie them together in your write-up (don't list them as two unrelated items).
+3. Read Slack thread replies (the \`↳\` lines) to understand whether a discussion concluded in a decision, an unblock, a handoff, or an open question. Quote the *outcome*, not the opening message.
+4. Infer status honestly. If a PR is still open with unresolved review comments, it is "in progress" — not "done". If a thread ends with "still blocked on X", that's a real blocker. If someone committed to deliver something by a date, note it as a commitment.
+5. Group related activity. A PR + its linked issue + the Slack thread about it = ONE narrative item, not three bullets. Collapse accordingly.
+6. Distinguish work you did from work you reviewed/discussed. Both belong in the standup, but frame them differently ("Merged …" vs "Reviewed …" vs "Aligned on … with @person").
+
+REQUIRED OUTPUT FORMAT — follow exactly:
 
 Scrum Updates (${dateFrom} to ${dateTo})
 
 ## [Day of week] ([YYYY-MM-DD])
-- Bullet point of work accomplished on that day, with markdown links where available
-- Another bullet if there was more work that day
+- Substantive bullet describing what was accomplished and WHY it matters (the problem solved, the mechanism, the impact). Use markdown links for every PR/issue/MR/message with a URL.
+- Another bullet if there was distinct work that day.
 
-(Repeat for each day that had meaningful activity, in chronological order. Skip days with no activity.)
+(Repeat for each day with meaningful activity, chronological. Skip days with nothing real.)
 
 ## In Progress
-- Active work items that are still ongoing
+- Active items with a one-line status: what stage it's at, what's pending (e.g. "awaiting review from @X", "iterating on feedback re: caching strategy", "design signed off, implementation ~60% through").
 
 ## Blockers
-- Impediments, things waiting on others, or external dependencies
-- If none: None at this time.
+- Concrete impediments with the *thing* being waited on and *who/what* owns the unblock. If none: None at this time.
 
 ## Next Steps
-- Concrete, actionable items planned next
+- Concrete, near-term actions with enough specificity that a reader can tell what will actually ship.
 
-RULES:
-- Only include days that have actual activity. Do not invent or pad entries.
-- Group related activity on the same day into a single bullet when it makes sense.
-- Use markdown links [label](url) for every PR, MR, issue, commit, or message that has a URL.
-- For GitHub/GitLab: format as [repo#number](url) e.g. [myrepo#42](https://github.com/...)
-- For Jira: format as [PROJ-123](url)
-- Be concise — each bullet should be one clear sentence.
-- Ignore noise: bot messages, trivial reactions, automated notifications.
-- Infer blockers from Slack/Teams conversations (e.g. "waiting on X", "blocked by Y").
-- Keep In Progress, Blockers, Next Steps to 3–5 bullets max each.
-- Do not add any preamble, explanation, or closing remarks — output only the standup.`;
+WRITING RULES:
+- Technical and specific. Say "migrated the ingest pipeline to use bulk inserts, cutting write latency ~40%" — not "worked on performance".
+- Reference people by @handle when a thread credits them (reviewer, approver, person you unblocked).
+- Use markdown links [label](url) for everything linkable. GitHub/GitLab: [repo#number](url). Jira: [PROJ-123](url). Commits: [sha7](url). Slack threads: [#channel](permalink) when relevant.
+- Integrate comment/thread insight into bullets — don't quote raw comments. Summarize the takeaway.
+- Flag unresolved questions explicitly ("open question: should we gate this behind a feature flag?").
+- Ignore noise: bot messages, emoji-only reactions, CI pings, auto-assignments. If a PR has no real discussion and is trivial (typo, bump), it's one line or roll it into a group.
+- Keep In Progress / Blockers / Next Steps to 3–6 bullets each. Prefer fewer, meatier bullets over many shallow ones.
+- Professional tone — neither breezy nor bureaucratic. Past tense for accomplishments, present for in-progress, future for next steps.
+- Never invent activity. If the data is thin for a given day, keep it thin. Never pad.
+- Output ONLY the standup — no preamble, no meta-commentary, no closing.`;
 }
 
 // ─── Route handler ────────────────────────────────────────────────────────────
