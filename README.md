@@ -136,7 +136,7 @@ Open [http://localhost:3000](http://localhost:3000).
 |---|---|
 | **Anthropic** | ~$0.01–0.03 |
 | **OpenAI** | Not tested |
-| **DeepSeek** | 
+| **DeepSeek** | ~$0.001-0.005 |
 
 ---
 
