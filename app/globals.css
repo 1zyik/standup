@@ -1,0 +1,49 @@
+@import "tailwindcss";
+
+:root {
+  --background: #0c0c10;
+  --surface: #13131a;
+  --surface-2: #1a1a24;
+  --surface-3: #20202c;
+  --border: #2a2a3a;
+  --border-subtle: #1e1e2a;
+  --text-primary: #e4e4f0;
+  --text-secondary: #8080a0;
+  --text-muted: #4a4a60;
+  --accent: #7c6fff;
+  --accent-hover: #9080ff;
+  --accent-dim: rgba(124, 111, 255, 0.14);
+  --accent-border: rgba(124, 111, 255, 0.3);
+  --green: #34d399;
+  --green-dim: rgba(52, 211, 153, 0.1);
+  --yellow: #fbbf24;
+  --yellow-dim: rgba(251, 191, 36, 0.1);
+  --red: #f87171;
+  --red-dim: rgba(248, 113, 113, 0.1);
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background-color: var(--background);
+  color: var(--text-primary);
+  font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', system-ui, sans-serif;
+  font-size: 14px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+::selection {
+  background: var(--accent-dim);
+  color: var(--text-primary);
+}
+
+::-webkit-scrollbar { width: 5px; height: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
