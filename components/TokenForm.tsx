@@ -14,7 +14,7 @@ export type FormData = {
   aiModel: string;
   integrations: {
     github?: string;
-    slack?: string;
+    slack?: { token: string; cookie?: string; workspace?: string };
     gitlab?: { token: string; url: string };
     jira?: { url: string; email: string; token: string };
     teams?: string;
@@ -60,7 +60,11 @@ const INTEGRATIONS: IntegrationDef[] = [
   {
     id: "slack", label: "Slack", icon: "#", color: "#e01e5a",
     docsTab: "slack",
-    fields: [{ key: "token", label: "User OAuth Token", placeholder: "xoxp-…", type: "password", hint: "channels:history, search:read scopes" }],
+    fields: [
+      { key: "token", label: "User Token", placeholder: "xoxp-… or xoxc-…", type: "password", hint: "xoxp- (User OAuth) or xoxc- (browser session)" },
+      { key: "cookie", label: "Cookie 'd' value (xoxc- only)", placeholder: "xoxd-…", type: "password", hint: "Required for xoxc- tokens. Copy the 'd' cookie from slack.com in your browser." },
+      { key: "workspace", label: "Workspace subdomain (xoxc- only)", placeholder: "myteam", type: "text", hint: "The bit before .slack.com in your workspace URL." },
+    ],
   },
   {
     id: "gitlab", label: "GitLab", icon: "⬠", color: "#fc6d26",
@@ -200,7 +204,12 @@ export default function TokenForm({ onSubmit }: Props) {
     const def = INTEGRATIONS.find((i) => i.id === id)!;
     return def.fields.every((f) => {
       const v = getField(id, f.key).trim();
-      if (f.key === "url" && (id === "gitlab")) return true; // optional
+      if (f.key === "url" && id === "gitlab") return true; // optional
+      if (id === "slack" && (f.key === "cookie" || f.key === "workspace")) {
+        // Only required when the token is an xoxc- browser-session token.
+        const token = getField("slack", "token").trim();
+        if (!token.startsWith("xoxc-") && !token.startsWith("xoxs-")) return true;
+      }
       return v.length > 0;
     });
   });
@@ -212,7 +221,16 @@ export default function TokenForm({ onSubmit }: Props) {
 
     const integrations: FormData["integrations"] = {};
     if (enabled.has("github")) integrations.github = getField("github", "token");
-    if (enabled.has("slack"))  integrations.slack  = getField("slack",  "token");
+    if (enabled.has("slack"))  {
+      const slackToken = getField("slack", "token");
+      const slackCookie = getField("slack", "cookie").trim();
+      const slackWorkspace = getField("slack", "workspace").trim().replace(/^https?:\/\//, "").replace(/\.slack\.com.*$/, "");
+      integrations.slack = {
+        token: slackToken,
+        cookie: slackCookie || undefined,
+        workspace: slackWorkspace || undefined,
+      };
+    }
     if (enabled.has("gitlab")) integrations.gitlab = { token: getField("gitlab", "token"), url: getField("gitlab", "url") || "https://gitlab.com" };
     if (enabled.has("jira"))   integrations.jira   = { url: getField("jira", "url"), email: getField("jira", "email"), token: getField("jira", "token") };
     if (enabled.has("teams"))  integrations.teams  = getField("teams",  "token");
@@ -343,7 +361,14 @@ export default function TokenForm({ onSubmit }: Props) {
                   </button>
                 </div>
                 <div style={{ display: "flex", flexDirection: "column", gap: 6, paddingLeft: 20, borderLeft: `2px solid ${intg.color}30` }}>
-                  {intg.fields.map((field) => (
+                  {intg.fields.filter((field) => {
+                    if (intg.id !== "slack") return true;
+                    if (field.key === "cookie" || field.key === "workspace") {
+                      const t = getField("slack", "token").trim();
+                      return t.startsWith("xoxc-") || t.startsWith("xoxs-");
+                    }
+                    return true;
+                  }).map((field) => (
                     <div key={field.key}>
                       <p style={{ fontSize: 10, color: "var(--text-muted)", marginBottom: 4, fontWeight: 500 }}>{field.label}</p>
                       <PasswordInput
