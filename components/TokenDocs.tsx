@@ -38,6 +38,7 @@ const DOCS: Record<TabId, Doc> = {
       { title: "Set resource owner and repository access", detail: "Under Resource owner, select yourself or your org. Under Repository access, choose All repositories or specific repos you want standup coverage for." },
       { title: "Grant the required permissions", detail: "Under Repository permissions enable the four permissions listed in the scopes box above. No account or organisation permissions are needed." },
       { title: "Generate and copy immediately", detail: "Click Generate token. Copy the token — GitHub shows it only once. It will start with github_pat_…", warning: "You cannot view the token again after leaving this page. Store it securely." },
+      { title: "Authorize the token for SSO orgs (classic tokens only)", detail: "If your organization enforces SAML SSO and you're using a classic PAT (ghp_…), open github.com/settings/tokens, click 'Configure SSO' next to the token, and authorize each org you want activity from. Without this, the API silently returns no results from those orgs.", tip: "Fine-grained tokens authorize per-org at creation time and don't need this step." },
     ],
     links: [
       { label: "Fine-grained Personal Access Tokens", href: "https://github.com/settings/tokens?type=beta" },
@@ -65,6 +66,7 @@ const DOCS: Record<TabId, Doc> = {
       { title: "Add User Token Scopes — not Bot Scopes", detail: "Under User Token Scopes (the second scopes section), add all scopes listed in the permissions box above.", warning: "Add scopes under User Token Scopes, not Bot Token Scopes. Bot tokens (xoxb-…) cannot read your personal messages." },
       { title: "Install the app to your workspace", detail: "Scroll back to the top and click Install to Workspace. Review and authorise the permissions." },
       { title: "Copy the User OAuth Token", detail: "After installing, the token appears at the top of the OAuth & Permissions page. It starts with xoxp-…", warning: "Copy only the User OAuth Token (xoxp-…). The Bot User OAuth Token (xoxb-…) will not work for reading your messages." },
+      { title: "Alternative: browser session token (xoxc-…)", detail: "If your workspace blocks custom apps, open Slack in a browser, open DevTools → Application → Local Storage → 'localConfig_v2', and copy the team's token (starts with xoxc-). Then open Application → Cookies → slack.com, and copy the value of the 'd' cookie (starts with xoxd-…). Paste the token, the cookie, and your workspace subdomain into the form.", warning: "xoxc- tokens are tied to your browser session and rotate when you sign out. They mimic your browser, so use them only for personal scripts." },
     ],
     links: [
       { label: "Slack API Dashboard — Your Apps", href: "https://api.slack.com/apps" },

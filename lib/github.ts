@@ -60,6 +60,7 @@ export type GitHubData = {
   reviews: GitHubReview[];
   comments: GitHubComment[];
   commits: GitHubCommit[];
+  ssoWarnings?: string[];
   summary: {
     prs: number;
     issues: number;
@@ -69,8 +70,31 @@ export type GitHubData = {
   };
 };
 
-async function ghFetch(path: string, token: string) {
-  const res = await fetch(`https://api.github.com${path}`, {
+// Classic PATs against SSO-protected orgs return 403 with a `x-github-sso`
+// header pointing to the authorization URL. We surface that as a clear error
+// so the user knows to click "Configure SSO" on their PAT page.
+function ssoErrorFromHeader(res: Response): string | null {
+  const sso = res.headers.get("x-github-sso");
+  if (!sso) return null;
+  // Header looks like: `required; url=https://github.com/orgs/<org>/sso?...`
+  // or a comma-separated list of `partial-results; organizations=<id>,<id>`
+  const urlMatch = sso.match(/url=([^,;\s]+)/);
+  const orgsMatch = sso.match(/organizations=([^,;\s]+)/);
+  if (urlMatch) {
+    return `This token needs SSO authorization. Visit ${urlMatch[1]} to authorize it, or open github.com/settings/tokens and click "Configure SSO" next to the token.`;
+  }
+  if (orgsMatch) {
+    return `Token has only partial SSO access (orgs: ${orgsMatch[1]}). Open github.com/settings/tokens, click "Configure SSO" next to the token, and authorize each organization you want included.`;
+  }
+  return `SSO authorization required: ${sso}`;
+}
+
+// Collected during a single fetchGitHubData call so we can surface SSO
+// partial-results warnings if the user ends up with zero activity.
+const ssoWarnings = new Set<string>();
+
+async function ghRequest(url: string, token: string) {
+  const res = await fetch(url, {
     headers: {
       Authorization: `Bearer ${token}`,
       Accept: "application/vnd.github+json",
@@ -78,29 +102,26 @@ async function ghFetch(path: string, token: string) {
     },
   });
   if (!res.ok) {
+    const ssoMsg = ssoErrorFromHeader(res);
+    if (ssoMsg) throw new Error(ssoMsg);
     const body = await res.text();
     throw new Error(`GitHub API error ${res.status}: ${body.slice(0, 200)}`);
   }
+  const partial = ssoErrorFromHeader(res);
+  if (partial) ssoWarnings.add(partial);
   return res.json();
+}
+
+async function ghFetch(path: string, token: string) {
+  return ghRequest(`https://api.github.com${path}`, token);
 }
 
 async function ghSearch(query: string, token: string, perPage = 100) {
   const encoded = encodeURIComponent(query);
-  const res = await fetch(
+  return ghRequest(
     `https://api.github.com/search/issues?q=${encoded}&per_page=${perPage}&sort=updated&order=desc`,
-    {
-      headers: {
-        Authorization: `Bearer ${token}`,
-        Accept: "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-      },
-    }
+    token
   );
-  if (!res.ok) {
-    const body = await res.text();
-    throw new Error(`GitHub search error ${res.status}: ${body.slice(0, 200)}`);
-  }
-  return res.json();
 }
 
 function repoFromUrl(url: string) {
@@ -123,6 +144,8 @@ export async function fetchGitHubData(
   // If explicit date range provided, use it; otherwise derive from days
   const since = dateFrom ? new Date(dateFrom).toISOString() : sinceDate(days);
   const sinceDate2 = since.slice(0, 10);
+
+  ssoWarnings.clear();
 
   // Get authenticated user
   const user = await ghFetch("/user", token);
@@ -224,7 +247,7 @@ export async function fetchGitHubData(
     try {
       // Strategy 2: per-repo commits from repos accessible to this token
       const reposRes = await fetch(
-        `https://api.github.com/user/repos?sort=updated&per_page=30&affiliation=owner,collaborator`,
+        `https://api.github.com/user/repos?sort=updated&per_page=50&affiliation=owner,collaborator,organization_member`,
         { headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json" } }
       );
       if (reposRes.ok) {
@@ -274,6 +297,13 @@ export async function fetchGitHubData(
     } catch { /* commits are best-effort */ }
   }
 
+  const totalActivity = prs.length + issues.length + reviews.length + commits.length;
+  if (totalActivity === 0 && ssoWarnings.size > 0) {
+    throw new Error(
+      `No activity found, and one or more organizations are restricting access via SSO. ${[...ssoWarnings].join(" ")}`
+    );
+  }
+
   return {
     user: { login: user.login, name: user.name || user.login, avatar_url: user.avatar_url },
     prs,
@@ -281,6 +311,7 @@ export async function fetchGitHubData(
     reviews,
     comments: [],
     commits,
+    ssoWarnings: ssoWarnings.size > 0 ? [...ssoWarnings] : undefined,
     summary: {
       prs: prs.length,
       issues: issues.length,

@@ -24,11 +24,51 @@ export type SlackData = {
   };
 };
 
-async function slackFetch(method: string, token: string, params: Record<string, string> = {}) {
+export type SlackAuth = {
+  token: string;
+  // For browser-extracted xoxc- tokens we also need the matching `d` cookie
+  // (xoxd-…) and the workspace subdomain (e.g. "myteam" from
+  // myteam.slack.com). xoxp-/xoxb- tokens ignore both.
+  cookie?: string;
+  workspace?: string;
+};
+
+function isBrowserToken(token: string) {
+  return token.startsWith("xoxc-") || token.startsWith("xoxs-");
+}
+
+async function slackFetch(method: string, auth: SlackAuth, params: Record<string, string> = {}) {
+  const browserToken = isBrowserToken(auth.token);
+
+  if (browserToken) {
+    if (!auth.cookie) {
+      throw new Error(
+        `xoxc-/xoxs- tokens require the matching 'd' cookie (xoxd-…). Open Slack in a browser, copy the value of the 'd' cookie under slack.com, and paste it into the Cookie field.`
+      );
+    }
+    if (!auth.workspace) {
+      throw new Error(
+        `xoxc-/xoxs- tokens require the workspace subdomain (e.g. 'myteam' from myteam.slack.com). Add it to the Workspace field.`
+      );
+    }
+    const body = new URLSearchParams({ token: auth.token, ...params }).toString();
+    const res = await fetch(`https://${auth.workspace}.slack.com/api/${method}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
+        Cookie: `d=${auth.cookie}`,
+      },
+      body,
+    });
+    const data = await res.json();
+    if (!data.ok) throw new Error(`Slack API error (${method}): ${data.error}`);
+    return data;
+  }
+
   const qs = new URLSearchParams(params).toString();
   const res = await fetch(`https://slack.com/api/${method}?${qs}`, {
     headers: {
-      Authorization: `Bearer ${token}`,
+      Authorization: `Bearer ${auth.token}`,
       "Content-Type": "application/json",
     },
   });
@@ -46,7 +86,7 @@ function sinceTs(days: number) {
 }
 
 export async function fetchSlackData(
-  token: string,
+  auth: SlackAuth,
   days: number,
   dateFrom?: string,
   dateTo?: string
@@ -56,21 +96,21 @@ export async function fetchSlackData(
     : sinceTs(days);
 
   // Get current user
-  const authRes = await slackFetch("auth.test", token);
+  const authRes = await slackFetch("auth.test", auth);
   const userId = authRes.user_id as string;
   const userName = authRes.user as string;
 
   // Get user profile for real name
   let realName = userName;
   try {
-    const profileRes = await slackFetch("users.info", token, { user: userId });
+    const profileRes = await slackFetch("users.info", auth, { user: userId });
     realName = profileRes.user?.profile?.real_name || userName;
   } catch {
     // profile is best-effort
   }
 
   // Search for messages sent by the user
-  const searchRes = await slackFetch("search.messages", token, {
+  const searchRes = await slackFetch("search.messages", auth, {
     query: `from:${userName}`,
     count: "100",
     sort: "timestamp",
@@ -105,7 +145,7 @@ export async function fetchSlackData(
   // Also try to fetch history from joined channels if we have fewer than 20 messages
   if (rawMessages.length < 20) {
     try {
-      const channelsRes = await slackFetch("conversations.list", token, {
+      const channelsRes = await slackFetch("conversations.list", auth, {
         types: "public_channel,private_channel",
         limit: "200",
         exclude_archived: "true",
@@ -118,7 +158,7 @@ export async function fetchSlackData(
       for (const ch of joinedChannels) {
         channelSet.set(ch.id, ch.name);
         try {
-          const histRes = await slackFetch("conversations.history", token, {
+          const histRes = await slackFetch("conversations.history", auth, {
             channel: ch.id,
             oldest,
             limit: "100",

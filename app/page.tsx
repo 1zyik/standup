@@ -90,7 +90,12 @@ export default function Home() {
         const res = await fetch("/api/slack", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ token: integrations.slack, days, dateFrom, dateTo }),
+          body: JSON.stringify({
+            token: integrations.slack.token,
+            cookie: integrations.slack.cookie,
+            workspace: integrations.slack.workspace,
+            days, dateFrom, dateTo,
+          }),
           signal: ctrl.signal,
         });
         if (!res.ok) { const e = await res.json(); throw new Error(e.error || "Slack fetch failed"); }
