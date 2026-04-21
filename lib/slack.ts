@@ -3,6 +3,7 @@ export type SlackThreadReply = {
   real_name?: string;
   text: string;
   ts: string;
+  isOwn?: boolean; // true if the authenticated user posted this reply
 };
 
 export type SlackMessage = {
@@ -242,7 +243,13 @@ export async function fetchSlackData(
           if (!text) continue;
           const uid = (r.user as string) || "";
           const real_name = uid ? await resolveUserName(uid) : undefined;
-          replies.push({ user: uid, real_name, text, ts: r.ts as string });
+          replies.push({
+            user: uid,
+            real_name,
+            text,
+            ts: r.ts as string,
+            isOwn: uid === userId,
+          });
           if (replies.length >= 10) break;
         }
         if (replies.length > 0) m.thread = replies;
