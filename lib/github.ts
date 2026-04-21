@@ -2,6 +2,7 @@ export type ThreadComment = {
   author: string;
   body: string;
   created_at: string;
+  isOwn?: boolean; // true if the authenticated user wrote this comment
 };
 
 export type GitHubPR = {
@@ -20,7 +21,17 @@ export type GitHubPR = {
   comments?: ThreadComment[];
   reviewComments?: ThreadComment[];
   linkedRefs?: string[]; // e.g. ["owner/repo#42", "#17"] extracted from body
+  userCommentCount?: number; // user's own comments on the PR thread (reply participation)
 };
+
+// How the authenticated user is involved in a given issue. Drives standup phrasing.
+// We only record issues the user actually contributed to — mere mentions/tags
+// are excluded upstream so they never reach the standup prompt.
+//   "author"    — user opened the issue
+//   "commenter" — user posted at least one comment
+//   "actor"     — user performed a stage-change event (closed, reopened, labeled, etc.)
+//                 without opening or commenting on it
+export type IssueViewerRole = "author" | "commenter" | "actor";
 
 export type GitHubIssue = {
   id: number;
@@ -34,8 +45,14 @@ export type GitHubIssue = {
   body: string | null;
   labels: string[];
   assignee: boolean;
+  author: boolean; // user opened the issue
+  viewerRole: IssueViewerRole;
   comments?: ThreadComment[];
+  userCommentCount?: number;
   linkedRefs?: string[];
+  // Stage-change events the user performed on this issue within the window.
+  // Populated when the user isn't the author/commenter but acted on the issue.
+  stageActions?: string[];
 };
 
 export type GitHubReview = {
@@ -161,11 +178,19 @@ export async function fetchGitHubData(
   // Get authenticated user
   const user = await ghFetch("/user", token);
 
-  // Parallel: PRs authored + PRs reviewed + issues
-  const [prSearch, reviewSearch, issueSearch] = await Promise.all([
+  // Parallel: PRs authored + PRs reviewed + three targeted issue searches.
+  // We deliberately avoid `involves:` for issues because it surfaces
+  // issues the user was only @-mentioned on — which generates hallucinated
+  // "I worked on X" entries. Instead we pull the three ways you can
+  // directly contribute (author, commenter, assignee) and later verify
+  // that assignee-only matches include at least one user-actioned stage
+  // change before keeping them.
+  const [prSearch, reviewSearch, authorIssueSearch, commenterIssueSearch, assigneeIssueSearch] = await Promise.all([
     ghSearch(`type:pr author:${user.login} updated:>=${sinceDate2}`, token, 100),
     ghSearch(`type:pr reviewed-by:${user.login} updated:>=${sinceDate2}`, token, 50),
-    ghSearch(`type:issue involves:${user.login} updated:>=${sinceDate2}`, token, 100),
+    ghSearch(`type:issue author:${user.login} updated:>=${sinceDate2}`, token, 60),
+    ghSearch(`type:issue commenter:${user.login} updated:>=${sinceDate2}`, token, 60),
+    ghSearch(`type:issue assignee:${user.login} updated:>=${sinceDate2}`, token, 60),
   ]);
 
   // Process PRs
@@ -186,10 +211,43 @@ export async function fetchGitHubData(
     labels: ((item.labels as Array<Record<string, unknown>>) ?? []).map((l) => l.name as string),
   }));
 
-  // Process issues (filter out PRs that appear as issues)
-  const issues: GitHubIssue[] = issueSearch.items
-    .filter((item: Record<string, unknown>) => !item.pull_request)
-    .map((item: Record<string, unknown>) => ({
+  // Merge the three issue searches, tracking which one(s) surfaced each issue.
+  // Author/commenter matches imply direct contribution. Assignee-only matches
+  // are provisional — they get dropped below unless events show the user also
+  // did something actionable.
+  type IssueSource = "author" | "commenter" | "assignee";
+  const issueDraft = new Map<
+    string,
+    { item: Record<string, unknown>; sources: Set<IssueSource> }
+  >();
+  function mergeIssueSearch(
+    items: Array<Record<string, unknown>>,
+    source: IssueSource
+  ) {
+    for (const item of items) {
+      if (item.pull_request) continue; // skip PRs that also match issue searches
+      const key = item.html_url as string;
+      const existing = issueDraft.get(key);
+      if (existing) existing.sources.add(source);
+      else issueDraft.set(key, { item, sources: new Set([source]) });
+    }
+  }
+  mergeIssueSearch(authorIssueSearch.items, "author");
+  mergeIssueSearch(commenterIssueSearch.items, "commenter");
+  mergeIssueSearch(assigneeIssueSearch.items, "assignee");
+
+  const issues: GitHubIssue[] = [...issueDraft.values()].map(({ item, sources }) => {
+    const isAuthor = sources.has("author");
+    const isCommenter = sources.has("commenter");
+    const isAssignee = sources.has("assignee");
+    // Provisional role. Assignee-only rows are kept for now and filtered
+    // after event enrichment (see below). Author/commenter locked in here.
+    const viewerRole: IssueViewerRole = isAuthor
+      ? "author"
+      : isCommenter
+        ? "commenter"
+        : "actor"; // placeholder — confirmed or dropped after events check
+    return {
       id: item.id as number,
       number: item.number as number,
       title: item.title as string,
@@ -200,10 +258,11 @@ export async function fetchGitHubData(
       updated_at: item.updated_at as string,
       body: (item.body as string | null)?.slice(0, 300) ?? null,
       labels: ((item.labels as Array<Record<string, unknown>>) ?? []).map((l) => l.name as string),
-      assignee: !!(item.assignees as unknown[])?.some?.(
-        (a) => (a as Record<string, unknown>).login === user.login
-      ),
-    }));
+      assignee: isAssignee,
+      author: isAuthor,
+      viewerRole,
+    };
+  });
 
   // ── Enrichment: fetch comments + linked refs for recently active PRs/issues ──
   // Bounded to keep latency reasonable: top N by updated_at, ≤8 comments each.
@@ -239,11 +298,15 @@ export async function fetchGitHubData(
       const data = await ghFetch(`/repos/${repo}/issues/${number}/comments?per_page=${MAX_COMMENTS}&sort=created&direction=desc`, token);
       if (!Array.isArray(data)) return [];
       return data
-        .map((c: Record<string, unknown>) => ({
-          author: ((c.user as Record<string, unknown>)?.login as string) || "unknown",
-          body: trimComment((c.body as string) || ""),
-          created_at: c.created_at as string,
-        }))
+        .map((c: Record<string, unknown>) => {
+          const author = ((c.user as Record<string, unknown>)?.login as string) || "unknown";
+          return {
+            author,
+            body: trimComment((c.body as string) || ""),
+            created_at: c.created_at as string,
+            isOwn: author === user.login,
+          };
+        })
         .filter((c) => c.body.length > 0)
         .slice(0, MAX_COMMENTS);
     } catch { return []; }
@@ -254,19 +317,68 @@ export async function fetchGitHubData(
       const data = await ghFetch(`/repos/${repo}/pulls/${number}/comments?per_page=${MAX_COMMENTS}&sort=created&direction=desc`, token);
       if (!Array.isArray(data)) return [];
       return data
-        .map((c: Record<string, unknown>) => ({
-          author: ((c.user as Record<string, unknown>)?.login as string) || "unknown",
-          body: trimComment((c.body as string) || ""),
-          created_at: c.created_at as string,
-        }))
+        .map((c: Record<string, unknown>) => {
+          const author = ((c.user as Record<string, unknown>)?.login as string) || "unknown";
+          return {
+            author,
+            body: trimComment((c.body as string) || ""),
+            created_at: c.created_at as string,
+            isOwn: author === user.login,
+          };
+        })
         .filter((c) => c.body.length > 0)
         .slice(0, MAX_COMMENTS);
     } catch { return []; }
   }
 
+  // Issue timeline events that we treat as "moving the issue between stages".
+  // Simple assignment/unassignment and renames are excluded — they don't
+  // represent workflow progress on their own.
+  const STAGE_EVENTS = new Set([
+    "closed",
+    "reopened",
+    "labeled",
+    "unlabeled",
+    "milestoned",
+    "demilestoned",
+    "moved_columns_in_project",
+    "converted_to_discussion",
+    "transferred",
+  ]);
+  const sinceMsIssues = new Date(since).getTime();
+  async function fetchUserStageEvents(repo: string, number: number): Promise<string[]> {
+    try {
+      const data = await ghFetch(
+        `/repos/${repo}/issues/${number}/events?per_page=50`,
+        token
+      );
+      if (!Array.isArray(data)) return [];
+      const actions: string[] = [];
+      for (const e of data as Array<Record<string, unknown>>) {
+        const eventType = e.event as string;
+        const actor = ((e.actor as Record<string, unknown>)?.login as string) || "";
+        const at = new Date((e.created_at as string) || 0).getTime();
+        if (
+          actor === user.login &&
+          at >= sinceMsIssues &&
+          STAGE_EVENTS.has(eventType)
+        ) {
+          actions.push(eventType);
+        }
+      }
+      return actions;
+    } catch {
+      return [];
+    }
+  }
+
   // Sort PRs and issues by most recently updated, enrich the top N in parallel.
   const prsByRecency = [...prs].sort((a, b) => b.updated_at.localeCompare(a.updated_at));
   const issuesByRecency = [...issues].sort((a, b) => b.updated_at.localeCompare(a.updated_at));
+
+  // Assignee-only issues (provisional role "actor") still need event
+  // verification before we know whether to keep them at all.
+  const assigneeOnlyIssues = issuesByRecency.filter((i) => i.viewerRole === "actor");
 
   await Promise.all([
     ...prsByRecency.slice(0, MAX_ENRICH_PRS).map(async (pr) => {
@@ -276,13 +388,57 @@ export async function fetchGitHubData(
       ]);
       pr.comments = cs;
       pr.reviewComments = rcs;
+      pr.userCommentCount =
+        cs.filter((c) => c.isOwn).length + rcs.filter((c) => c.isOwn).length;
       pr.linkedRefs = extractLinkedRefs(pr.body, pr.repo);
     }),
     ...issuesByRecency.slice(0, MAX_ENRICH_ISSUES).map(async (issue) => {
-      issue.comments = await fetchComments(issue.repo, issue.number);
+      const cs = await fetchComments(issue.repo, issue.number);
+      issue.comments = cs;
+      issue.userCommentCount = cs.filter((c) => c.isOwn).length;
       issue.linkedRefs = extractLinkedRefs(issue.body, issue.repo);
     }),
+    // Event check for assignee-only matches. We bound this separately so it
+    // doesn't eat into the MAX_ENRICH_ISSUES budget reserved for comments.
+    ...assigneeOnlyIssues.slice(0, 10).map(async (issue) => {
+      const actions = await fetchUserStageEvents(issue.repo, issue.number);
+      if (actions.length > 0) issue.stageActions = actions;
+    }),
   ]);
+
+  // Final filter: drop assignee-only rows that didn't turn out to carry any
+  // direct user contribution (no comments and no stage actions). Anything
+  // that survives has the user as author, commenter, or stage-actor.
+  const filteredIssues: GitHubIssue[] = [];
+  for (const issue of issues) {
+    if (issue.viewerRole === "author") {
+      filteredIssues.push(issue);
+      continue;
+    }
+    const hasComments = (issue.userCommentCount ?? 0) > 0;
+    const hasStageActions = (issue.stageActions?.length ?? 0) > 0;
+    if (issue.viewerRole === "commenter" && hasComments) {
+      filteredIssues.push(issue);
+      continue;
+    }
+    if (issue.viewerRole === "commenter" && !hasComments) {
+      // Commenter search matched but our bounded enrichment didn't find the
+      // user's comment (e.g. they commented on issue 20 and we only pulled
+      // top 8 by recency). Trust the search qualifier — keep it.
+      filteredIssues.push(issue);
+      continue;
+    }
+    // Provisional "actor" (assignee-only). Keep only if events confirm.
+    if (hasStageActions) {
+      filteredIssues.push(issue);
+      continue;
+    }
+    // Fallback: if we ran out of enrichment budget on an assignee-only row
+    // beyond the top 10, we can't verify — drop it rather than risk claiming
+    // work the user didn't do.
+  }
+  issues.length = 0;
+  issues.push(...filteredIssues);
 
   // Process reviews
   const reviews: GitHubReview[] = reviewSearch.items

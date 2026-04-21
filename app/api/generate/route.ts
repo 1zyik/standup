@@ -28,10 +28,24 @@ function fmt(iso: string) {
 
 type TimestampedItem = { date: string; source: string; text: string; url?: string };
 
-function formatThread(items: { author?: string; user?: string; real_name?: string; body?: string; text?: string }[]): string {
+// Thread replies include a mix of the user's own words and other people's.
+// We label the user's replies as `@you` so the prompt can cleanly distinguish
+// what the user actually said vs. what was said around them — prevents
+// hallucinated attribution when the user was only a bystander in a thread.
+function formatThread(
+  items: {
+    author?: string;
+    user?: string;
+    real_name?: string;
+    body?: string;
+    text?: string;
+    isOwn?: boolean;
+  }[]
+): string {
   return items
     .map((c) => {
-      const who = c.author || c.real_name || c.user || "unknown";
+      const rawWho = c.author || c.real_name || c.user || "unknown";
+      const who = c.isOwn ? "you" : rawWho;
       const what = (c.body || c.text || "").trim();
       return what ? `    ↳ @${who}: ${what}` : null;
     })
@@ -44,17 +58,23 @@ function ghItems(gh: GitHubData): TimestampedItem[] {
 
   for (const pr of gh.prs.slice(0, 40)) {
     const date = isoDay(pr.merged_at || pr.updated_at);
-    const status = pr.state === "merged" ? "Merged PR" : pr.state === "open" ? "Opened PR" : "Closed PR";
+    // All PRs in `gh.prs` are authored by the user (search filters by author).
+    const status = pr.state === "merged" ? "Authored, merged PR" : pr.state === "open" ? "Authored, open PR" : "Authored, closed PR";
     const draft = pr.draft ? " [Draft]" : "";
     const labels = pr.labels.length ? ` {labels: ${pr.labels.join(", ")}}` : "";
     const linked = pr.linkedRefs?.length ? `\n    linked: ${pr.linkedRefs.join(", ")}` : "";
     const body = pr.body ? `\n    description: ${pr.body.replace(/\s+/g, " ").slice(0, 400)}` : "";
     const conv = [...(pr.comments ?? []), ...(pr.reviewComments ?? [])];
     const thread = conv.length ? `\n${formatThread(conv)}` : "";
+    // Make the author's engagement level explicit so the model can tell
+    // "merged, no replies" (shipped cleanly) from "merged, 5 replies"
+    // (iterated through review). Both valid, but differently worth narrating.
+    const own = pr.userCommentCount ?? 0;
+    const engagement = own > 0 ? ` {your_replies: ${own}}` : "";
     items.push({
       date,
       source: "GitHub",
-      text: `${status}${draft}: [${pr.repo}#${pr.number}](${pr.url}) — ${pr.title}${labels}${body}${linked}${thread}`,
+      text: `${status}${draft}${engagement}: [${pr.repo}#${pr.number}](${pr.url}) — ${pr.title}${labels}${body}${linked}${thread}`,
       url: pr.url,
     });
   }
@@ -64,22 +84,38 @@ function ghItems(gh: GitHubData): TimestampedItem[] {
     items.push({
       date,
       source: "GitHub",
-      text: `Reviewed PR: [${r.pr_title}](${r.pr_url}) in ${r.repo}`,
+      text: `Reviewed PR (you reviewed someone else's PR): [${r.pr_title}](${r.pr_url}) in ${r.repo}`,
       url: r.pr_url,
     });
   }
 
   for (const issue of gh.issues.slice(0, 20)) {
     const date = isoDay(issue.updated_at);
-    const status = issue.state === "closed" ? "Closed issue" : "Worked on issue";
+    // Only issues the user directly contributed to reach this point —
+    // author/commenter/actor. Passive mentions are filtered upstream.
+    const closed = issue.state === "closed" ? " (issue closed)" : "";
+    const rolePrefix =
+      issue.viewerRole === "author"
+        ? `Opened issue${closed}`
+        : issue.viewerRole === "commenter"
+          ? `Commented on issue${closed}`
+          : `Acted on issue${closed}`;
     const labels = issue.labels.length ? ` {labels: ${issue.labels.join(", ")}}` : "";
     const linked = issue.linkedRefs?.length ? `\n    linked: ${issue.linkedRefs.join(", ")}` : "";
     const body = issue.body ? `\n    description: ${issue.body.replace(/\s+/g, " ").slice(0, 300)}` : "";
     const thread = issue.comments?.length ? `\n${formatThread(issue.comments)}` : "";
+    const own = issue.userCommentCount ?? 0;
+    const engagement = own > 0 ? ` {your_comments: ${own}}` : "";
+    // For the actor role, list the concrete stage events the user performed
+    // so the narrative can say "closed", "labeled ready-for-review", etc.
+    const actions =
+      issue.viewerRole === "actor" && issue.stageActions?.length
+        ? ` {your_actions: ${issue.stageActions.join(", ")}}`
+        : "";
     items.push({
       date,
       source: "GitHub",
-      text: `${status}: [${issue.repo}#${issue.number}](${issue.url}) — ${issue.title}${labels}${body}${linked}${thread}`,
+      text: `${rolePrefix}${engagement}${actions}: [${issue.repo}#${issue.number}](${issue.url}) — ${issue.title}${labels}${body}${linked}${thread}`,
       url: issue.url,
     });
   }
@@ -98,12 +134,15 @@ function ghItems(gh: GitHubData): TimestampedItem[] {
 }
 
 function slItems(sl: SlackData): TimestampedItem[] {
+  // All top-level Slack messages are authored by the user (search is
+  // scoped to `from:<user>`). Thread replies are labeled `@you` / `@other`
+  // by formatThread using the isOwn flag.
   return sl.messages.slice(0, 60).map((m) => {
     const thread = m.thread?.length ? `\n${formatThread(m.thread)}` : "";
     return {
       date: slackDay(m.ts),
       source: "Slack",
-      text: `#${m.channel_name || m.channel_id}: ${m.text.slice(0, 400)}${thread}`,
+      text: `You posted in #${m.channel_name || m.channel_id}: ${m.text.slice(0, 400)}${thread}`,
       url: m.permalink || undefined,
     };
   });
@@ -188,14 +227,29 @@ function buildContext(allItems: TimestampedItem[], dateFrom: string, dateTo: str
 function buildSystemPrompt(dateFrom: string, dateTo: string): string {
   return `You are a senior engineer writing your own standup. Your audience is other engineers and an engineering manager — they want substance, not a list of links. Synthesize the activity below into a technically credible, professionally-toned standup update.
 
+ATTRIBUTION — THIS IS THE MOST IMPORTANT RULE. Do not claim credit for work you did not do. The pipeline has already filtered out issues you were only mentioned or passively tagged on — every item here represents something you actually did. The prefix tells you what kind of contribution:
+- "Authored, merged PR" / "Authored, open PR" / "Authored, closed PR" — you wrote the PR. Report it as your work.
+- "Reviewed PR (you reviewed someone else's PR)" — frame as "Reviewed …", never as "Merged …" or "Shipped …".
+- "Opened issue" — you filed the issue; describe why you opened it and, if closed, the outcome.
+- "Commented on issue" — you engaged in the discussion but did not own the issue. Describe YOUR specific contribution from your own comments (lines labeled \`@you\`), not the issue as if you drove it end-to-end.
+- "Acted on issue" — you performed concrete stage changes listed in \`{your_actions: …}\` (e.g. \`closed\`, \`labeled\`, \`milestoned\`). Describe the action literally ("closed [repo#N] once the underlying fix landed", "labeled [repo#N] ready-for-review"). Do not invent a larger narrative about the issue beyond that action.
+- Metadata tags \`{your_replies: N}\` / \`{your_comments: N}\` tell you how many lines in the thread are actually yours. \`{your_actions: …}\` lists the verbs you performed. These are ground truth.
+
+In every thread, lines starting with "↳ @you:" are your own words; all other "↳ @handle:" lines are other people. Attribute accordingly:
+- If a thread reached a decision and @you didn't post, the DECISION is not yours. At most: "team converged on X" or skip.
+- If the unblock/answer came from someone else and @you never responded, don't say you unblocked it.
+- Slack top-level messages are yours ("You posted in #channel"). Thread replies from others are theirs.
+
+When in doubt, say less. Silence in the data is a signal, not a gap to fill.
+
 BEFORE YOU WRITE — reason carefully over the raw activity:
 
 1. Read each PR's description, review comments, and issue comments in full. The titles alone are not the story — the *discussion* is. Use comments to understand: what was the actual change, what concerns were raised, what was pushed back on, what was agreed, and what remains unresolved.
 2. Follow \`linked:\` references between PRs and issues. If a PR closes or references an issue, tie them together in your write-up (don't list them as two unrelated items).
-3. Read Slack thread replies (the \`↳\` lines) to understand whether a discussion concluded in a decision, an unblock, a handoff, or an open question. Quote the *outcome*, not the opening message.
+3. Read Slack thread replies (the \`↳\` lines) to understand whether a discussion concluded in a decision, an unblock, a handoff, or an open question. Quote the *outcome*, not the opening message. Only claim participation for lines marked \`@you\`.
 4. Infer status honestly. If a PR is still open with unresolved review comments, it is "in progress" — not "done". If a thread ends with "still blocked on X", that's a real blocker. If someone committed to deliver something by a date, note it as a commitment.
 5. Group related activity. A PR + its linked issue + the Slack thread about it = ONE narrative item, not three bullets. Collapse accordingly.
-6. Distinguish work you did from work you reviewed/discussed. Both belong in the standup, but frame them differently ("Merged …" vs "Reviewed …" vs "Aligned on … with @person").
+6. Distinguish work you shipped from work you reviewed or discussed. Frame them differently: "Merged …" (your PR), "Reviewed …" (someone else's PR), "Weighed in on …" (you commented on an issue), "Closed / labeled …" (stage actions you performed).
 
 REQUIRED OUTPUT FORMAT — follow exactly:
 
@@ -226,6 +280,7 @@ WRITING RULES:
 - Keep In Progress / Blockers / Next Steps to 3–6 bullets each. Prefer fewer, meatier bullets over many shallow ones.
 - Professional tone — neither breezy nor bureaucratic. Past tense for accomplishments, present for in-progress, future for next steps.
 - Never invent activity. If the data is thin for a given day, keep it thin. Never pad.
+- Never attribute to yourself what the thread shows someone else doing. If @you never spoke in a thread, you did not agree, align, decide, or unblock — the others did. It is fine and preferable to say "observed" or to omit the item entirely.
 - Output ONLY the standup — no preamble, no meta-commentary, no closing.`;
 }
 
